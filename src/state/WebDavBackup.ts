@@ -15,6 +15,10 @@ import { MultiChanBackup } from "react-native-turbo-lnd/protos/lightning_pb";
 import logger from "./../utils/log";
 const log = logger("WebDavBackup");
 
+// Keep exports and uploads ordered within each store. An older SCB must not
+// overwrite a newer one when automatic and manual backups overlap.
+const backupQueues = new WeakMap<object, Promise<void>>();
+
 export const WEBDAV_BACKUP_FILE = `blixt-wallet-backup-${Chain}${Debug ? "-debug" : ""}${Flavor ? `-${Flavor}` : ""}.b64`;
 
 export interface IWebDavBackupModel {
@@ -93,22 +97,30 @@ export const webDavBackup: IWebDavBackupModel = {
     actions.setChannelUpdateSubscriptionStarted(true);
   }),
 
-  makeBackup: thunk(async (_, _2, { getStoreState }) => {
-    const backupUrl = getWebDavBackupUrl(
-      getStoreState().settings.webDavBackupUrl,
-      WEBDAV_BACKUP_FILE,
-    );
-    const backup = await exportAllChannelBackups({});
-    const backupsB64 = base64.fromByteArray(
-      (backup.multiChanBackup as MultiChanBackup).multiChanBackup,
-    ); // TURBOLND uh weird
+  makeBackup: thunk((_, _2, { getStoreState, getStoreActions }) => {
+    const storeActions = getStoreActions();
+    const previous = backupQueues.get(storeActions) ?? Promise.resolve();
+    const task = previous.then(async () => {
+      const backupUrl = getWebDavBackupUrl(
+        getStoreState().settings.webDavBackupUrl,
+        WEBDAV_BACKUP_FILE,
+      );
+      const backup = await exportAllChannelBackups({});
+      const backupsB64 = base64.fromByteArray(
+        (backup.multiChanBackup as MultiChanBackup).multiChanBackup,
+      ); // TURBOLND uh weird
 
-    await uploadWebDavFile(backupUrl, backupsB64, {
-      username: getStoreState().settings.webDavBackupUsername,
-      password: (await getWebDavBackupPassword()) ?? "",
+      await uploadWebDavFile(backupUrl, backupsB64, {
+        username: getStoreState().settings.webDavBackupUsername,
+        password: (await getWebDavBackupPassword()) ?? "",
+      });
+
+      log.i("Backing up channels to WebDAV succeeded");
     });
 
-    log.i("Backing up channels to WebDAV succeeded");
+    // Preserve this caller's error, but allow the next backup to try again.
+    backupQueues.set(storeActions, task.catch(() => undefined));
+    return task;
   }),
 
   getBackup: thunk(async (_, _2, { getStoreState }) => {
